@@ -1,6 +1,9 @@
-numpy
-pandas
-scikit-learn
-lightgbm
-pyedflib
-joblib
+edfio==0.4.10
+joblib==1.4.2
+numpy==2.0.2
+pandas==2.2.2
+scikit-learn==1.6.0
+scipy==1.13.1
+tqdm==4.67.1
+lightgbm==4.5.0
+pyedflib==0.1.38
