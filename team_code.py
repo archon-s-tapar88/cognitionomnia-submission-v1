@@ -299,42 +299,52 @@ class SleepFMFeatureExtractor:
         patches = patches.transpose(1, 0, 2)  # (C, S, L)
         return patches
 
-    def _generate_embeddings(self, modality_data):
-        """Generate SleepFM embeddings from modality data."""
-        if self.model is None:
-            return None
+def _generate_embeddings(self, modality_data):
+    if self.model is None:
+        return None
 
-        all_embeddings = {}
+    all_embeddings = {}
+    chunk_patches = 60  # 5 minutes = 60 * 640 samples
+    chunk_samples = chunk_patches * self.patch_size
 
-        for mod in self.channel_groups.keys():
-            if mod not in modality_data:
-                all_embeddings[mod] = None
-                continue
+    for mod in self.channel_groups.keys():
+        if mod not in modality_data:
+            all_embeddings[mod] = None
+            continue
 
-            signal = modality_data[mod]  # (C, T)
-            patches = self._segment_into_patches(signal, self.patch_size)
-            if patches is None:
-                all_embeddings[mod] = None
-                continue
+        signal = modality_data[mod]  # (C, T)
+        C, T = signal.shape
 
-            C, S, L = patches.shape
+        # Truncate to multiple of chunk size
+        T_trunc = (T // chunk_samples) * chunk_samples
+        if T_trunc == 0:
+            all_embeddings[mod] = None
+            continue
 
-            # Convert to torch: (1, C, S, L)
-            x = torch.from_numpy(patches).float().unsqueeze(0).to(self.device)
+        signal = signal[:, :T_trunc]
+        n_chunks = T_trunc // chunk_samples
 
-            # Mask: (1, C) all True
+        # Process each chunk
+        chunk_embeddings = []
+        for i in range(n_chunks):
+            chunk = signal[:, i*chunk_samples:(i+1)*chunk_samples]
+            x = torch.from_numpy(chunk).float().unsqueeze(0).to(self.device)  # (1, C, chunk_samples)
             mask = torch.ones(1, C, dtype=torch.bool).to(self.device)
 
             with torch.no_grad():
-                pooled, per_timestep = self.model(x, mask)
+                pooled, _ = self.model(x, mask)
+            chunk_embeddings.append(pooled.cpu().numpy())
 
-            # pooled: (1, 128), per_timestep: (1, S, 128)
-            all_embeddings[mod] = {
-                'pooled': pooled.cpu().numpy(),
-                'per_timestep': per_timestep.cpu().numpy()
-            }
+        # Average across chunks
+        chunk_embeddings = np.stack(chunk_embeddings, axis=0)  # (n_chunks, 1, 128)
+        mean_embedding = chunk_embeddings.mean(axis=0)[0]  # (128,)
 
-        return all_embeddings
+        all_embeddings[mod] = {
+            'pooled': mean_embedding.reshape(1, -1),  # (1, 128)
+            'per_chunk': chunk_embeddings  # (n_chunks, 1, 128)
+        }
+
+    return all_embeddings
 
     def extract_features(self, edf_path):
         """
