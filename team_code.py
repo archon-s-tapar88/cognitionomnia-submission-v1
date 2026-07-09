@@ -116,24 +116,18 @@ class SleepFMFeatureExtractor:
             # The model class name is specified in config['model']
             model_name = self.model_config.get('model', 'SetTransformerContrastive')
 
-            # Add sleepfm to path if needed
-            sleepfm_models_path = os.path.join(SLEEPFM_BASE_PATH, 'models')
-            if sleepfm_models_path not in sys.path:
-                sys.path.insert(0, sleepfm_models_path)
-            if SLEEPFM_BASE_PATH not in sys.path:
-                sys.path.insert(0, SLEEPFM_BASE_PATH)
+            # Add repo root to sys.path so 'sleepfm' package is discoverable
+            repo_root = os.path.dirname(__file__)
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
 
-            # Try to import the model class
+            # Import the real SleepFM model architecture
             try:
-                from models import SetTransformerContrastive
+                from sleepfm.models.models import SetTransformerContrastive
                 model_class = SetTransformerContrastive
-            except ImportError:
-                try:
-                    from sleepfm.models.models import SetTransformerContrastive
-                    model_class = SetTransformerContrastive
-                except ImportError:
-                    # Define minimal model architecture inline if imports fail
-                    model_class = self._build_model_inline()
+            except ImportError as e:
+                print(f"Could not import real SleepFM model: {e}")
+                model_class = self._build_model_inline()
 
             # Instantiate model
             in_channels = self.model_config.get('in_channels', {
