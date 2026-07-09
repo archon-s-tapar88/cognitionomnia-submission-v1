@@ -1,0 +1,30 @@
+{
+  "BAS": [
+    "c3", "c4", "c3-m2", "c4-m1", "c3_m2", "c4_m1",
+    "f3", "f4", "f3-m2", "f4-m1", "f3_m2", "f4_m1",
+    "o1", "o2", "o1-m2", "o2-m1", "o1_m2", "o2_m1",
+    "fz", "fp1", "fp2", "fpz",
+    "eog", "eog_l", "eog_r", "eog_left", "eog_right",
+    "loc", "roc", "eog1", "eog2", "eog_l", "eog_r",
+    "left_eog", "right_eog", "eog_left_eye", "eog_right_eye"
+  ],
+  "RESP": [
+    "airflow", "flow", "thermal", "thermistor", "nasal_pressure", "nasal",
+    "abd", "abdomen", "chest", "thorax", "effort_abd", "effort_tho",
+    "effort", "resp_effort", "effort_abdomen", "effort_chest",
+    "spo2", "sao2", "osat", "o2sat", "pulse_ox", "oximeter",
+    "snore", "snoring"
+  ],
+  "EKG": [
+    "ecg", "ekg", "ecg-la", "ecg-v1", "ecg_i", "ecg_ii", "ecg1", "ecg2",
+    "ecg_l", "ecg_r", "heart_rate", "hr", "ecg_iii", "ecg_avf",
+    "ecg_avl", "ecg_avr", "ecg_v1", "ecg_v2", "ecg_v3", "ecg_v4",
+    "ecg_v5", "ecg_v6"
+  ],
+  "EMG": [
+    "chin1-chin2", "chin", "emg.subm", "emg", "chin1", "emg1", "chin2", "emg2",
+    "leg_l", "leg_r", "leg_left", "leg_right", "plm_l", "plm_r",
+    "emg_chin", "submental", "emg_leg_l", "emg_leg_r",
+    "leg_emg_left", "leg_emg_right", "limb_emg"
+  ]
+}
