@@ -13,8 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ## Include the following line if you have a requirements.txt file.
 RUN pip install -r requirements.txt
 
-## SleepFM weights are copied from repo via COPY ./ /challenge above
-## Make sure sleepfm/checkpoints/model_base/best.pt exists in your repo
-## Use: git lfs track "sleepfm/checkpoints/model_base/best.pt"
+## Set PYTHONPATH so 'sleepfm' package is discoverable
+ENV PYTHONPATH=/challenge
 
-ENV PYTHONPATH=/challenge:$PYTHONPATH
+CMD ["bash"]
