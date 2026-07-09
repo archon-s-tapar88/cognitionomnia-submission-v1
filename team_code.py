@@ -127,12 +127,27 @@ class SleepFMFeatureExtractor:
                 model_class = SetTransformerContrastive
             except ImportError as e:
                 print(f"Could not import real SleepFM model: {e}")
-                model_class = self._build_model_inline()
+                # Try installing missing deps
+                try:
+                    import subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "loguru", "einops", "timm", "-q"])
+                    from sleepfm.models.models import SetTransformerContrastive
+                    model_class = SetTransformerContrastive
+                except Exception as e2:
+                    print(f"Still failed after install attempt: {e2}")
+                    model_class = self._build_model_inline()
 
             # Instantiate model
-            in_channels = self.model_config.get('in_channels', {
+            raw_in_ch = self.model_config.get('in_channels', {
                 'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4
             })
+            # Handle both int (legacy) and dict formats
+            if isinstance(raw_in_ch, int):
+                in_channels = {'BAS': raw_in_ch, 'RESP': raw_in_ch, 'EKG': raw_in_ch, 'EMG': raw_in_ch}
+            elif isinstance(raw_in_ch, dict):
+                in_channels = raw_in_ch
+            else:
+                in_channels = {'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4}
             patch_size = self.model_config.get('patch_size', 640)
             embed_dim = self.model_config.get('embed_dim', 128)
             num_heads = self.model_config.get('num_heads', 8)
