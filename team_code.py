@@ -109,50 +109,28 @@ class SleepFMFeatureExtractor:
                     print(f"Channel groups not found at {SLEEPFM_CHANNEL_GROUPS_PATH}")
                 return
 
-            with open(SLEEPFM_CHANNEL_GROUPS_PATH, 'r') as f:
-                self.channel_groups = json.load(f)
-
             # Import SleepFM model architecture
-            # The model class name is specified in config['model']
-            model_name = self.model_config.get('model', 'SetTransformerContrastive')
-
-            # Add repo root to sys.path so 'sleepfm' package is discoverable
             repo_root = os.path.dirname(__file__)
             if repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
 
-            # Import the real SleepFM model architecture
             try:
-                from sleepfm.models.models import SetTransformerContrastive
-                model_class = SetTransformerContrastive
+                from sleepfm.models.models import SetTransformer
+                model_class = SetTransformer
             except ImportError as e:
-                print(f"Could not import real SleepFM model: {e}")
-                # Try installing missing deps
-                try:
-                    import subprocess
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "loguru", "einops", "timm", "-q"])
-                    from sleepfm.models.models import SetTransformerContrastive
-                    model_class = SetTransformerContrastive
-                except Exception as e2:
-                    print(f"Still failed after install attempt: {e2}")
-                    model_class = self._build_model_inline()
+                if self.verbose:
+                    print(f"Could not import SleepFM model: {e}")
+                self.model = None
+                return
 
-            # Instantiate model
-            raw_in_ch = self.model_config.get('in_channels', {
-                'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4
-            })
-            # Handle both int (legacy) and dict formats
-            if isinstance(raw_in_ch, int):
-                in_channels = {'BAS': raw_in_ch, 'RESP': raw_in_ch, 'EKG': raw_in_ch, 'EMG': raw_in_ch}
-            elif isinstance(raw_in_ch, dict):
-                in_channels = raw_in_ch
-            else:
-                in_channels = {'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4}
+            # Load config parameters
+            in_channels = self.model_config.get('in_channels', 1)
             patch_size = self.model_config.get('patch_size', 640)
             embed_dim = self.model_config.get('embed_dim', 128)
             num_heads = self.model_config.get('num_heads', 8)
             num_layers = self.model_config.get('num_layers', 6)
-            pooling_head = self.model_config.get('pooling_head', 'attention')
+            pooling_head = self.model_config.get('pooling_head', 8)
+            dropout = self.model_config.get('dropout', 0.0)
 
             self.model = model_class(
                 in_channels=in_channels,
@@ -161,7 +139,8 @@ class SleepFMFeatureExtractor:
                 num_heads=num_heads,
                 num_layers=num_layers,
                 pooling_head=pooling_head,
-                dropout=0.0
+                dropout=dropout,
+                max_seq_length=128
             )
 
             # Load weights
@@ -191,69 +170,6 @@ class SleepFMFeatureExtractor:
                 print(f"WARNING: Could not load SleepFM model: {e}")
             self.model = None
 
-    def _build_model_inline(self):
-        """Build minimal SleepFM model inline if imports fail."""
-        class InlineSleepFM(nn.Module):
-            def __init__(self, in_channels, patch_size, embed_dim, num_heads, num_layers, pooling_head, dropout):
-                super().__init__()
-                self.in_channels = in_channels
-                self.patch_size = patch_size
-                self.embed_dim = embed_dim
-                self.num_heads = num_heads
-                self.num_layers = num_layers
-                self.pooling_head = pooling_head
-                self.dropout = dropout
-
-                # Per-modality encoders
-                self.encoders = nn.ModuleDict()
-                for mod, n_ch in in_channels.items():
-                    layers = []
-                    in_ch = n_ch
-                    out_channels = [4, 8, 16, 32, 64, 128]
-                    for out_ch in out_channels:
-                        layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=5, stride=2, padding=2))
-                        layers.append(nn.BatchNorm1d(out_ch))
-                        layers.append(nn.ELU())
-                        in_ch = out_ch
-                    layers.append(nn.AdaptiveAvgPool1d(1))
-                    layers.append(nn.Flatten())
-                    layers.append(nn.Linear(128, embed_dim))
-                    self.encoders[mod] = nn.Sequential(*layers)
-
-                # Temporal transformer
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=embed_dim, nhead=num_heads,
-                    dim_feedforward=embed_dim*4, dropout=dropout,
-                    batch_first=True
-                )
-                self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-            def forward(self, x, mask=None):
-                # x: (B, C, S, L) where L=patch_size
-                B, C, S, L = x.shape
-                # Reshape for conv1d: (B*S, C, L)
-                x_flat = x.reshape(B * S, C, L)
-                # Determine modality from channel count
-                mod = None
-                for m, n_ch in self.in_channels.items():
-                    if C == n_ch or C <= n_ch:
-                        mod = m
-                        break
-                if mod is None:
-                    mod = 'BAS'
-                # Encode
-                tokens = self.encoders[mod](x_flat)  # (B*S, embed_dim)
-                tokens = tokens.reshape(B, S, self.embed_dim)
-                # Temporal transformer
-                if mask is not None and mask.dim() == 3:
-                    mask = mask.squeeze(1) if mask.shape[1] == 1 else mask[:, 0, :]
-                out = self.temporal_transformer(tokens)
-                # Return (pooled, tokens)
-                pooled = out.mean(dim=1)
-                return pooled, out
-
-        return InlineSleepFM
-
     def _edf_to_hdf5(self, edf_path, temp_dir):
         """Convert EDF to SleepFM-compatible HDF5 format."""
         try:
@@ -261,7 +177,10 @@ class SleepFMFeatureExtractor:
             import h5py
 
             raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
-            raw.resample(128.0)
+            
+            # Only resample if necessary to avoid long waits
+            if abs(raw.info['sfreq'] - 128.0) > 0.5:
+                raw.resample(128.0)
 
             subject_id = os.path.splitext(os.path.basename(edf_path))[0]
             hdf5_path = os.path.join(temp_dir, f"{subject_id}_psg.hdf5")
@@ -319,34 +238,41 @@ class SleepFMFeatureExtractor:
                         continue
 
                     data = mod_group['data'][:]  # (C, T)
-                    fs = mod_group.attrs.get('fs', 128.0)
                     C, T = data.shape
 
-                    # Segment into 5-second patches (640 samples at 128Hz)
                     patch_size = 640
                     n_patches = T // patch_size
                     if n_patches == 0:
                         all_embeddings[mod] = None
                         continue
 
-                    patches = []
-                    for i in range(n_patches):
-                        patch = data[:, i*patch_size:(i+1)*patch_size]
-                        patches.append(patch)
+                    # Truncate to multiple of patch_size
+                    data = data[:, :n_patches * patch_size]
 
-                    patches = np.stack(patches, axis=0)  # (S, C, L)
-                    patches = torch.from_numpy(patches).float().to(self.device)
-                    patches = patches.permute(1, 0, 2)  # (C, S, L)
-                    patches = patches.unsqueeze(0)  # (1, C, S, L)
+                    # Process in chunks to respect max_seq_length and avoid OOM
+                    max_patches_per_chunk = 128
+                    chunk_embeddings = []
 
-                    # Create mask (all valid)
-                    mask = torch.ones(1, C, n_patches, dtype=torch.bool).to(self.device)
+                    for chunk_start in range(0, n_patches, max_patches_per_chunk):
+                        chunk_end = min(chunk_start + max_patches_per_chunk, n_patches)
+                        chunk_len = (chunk_end - chunk_start) * patch_size
 
-                    with torch.no_grad():
-                        pooled, tokens = self.model(patches, mask)
+                        chunk_data = data[:, chunk_start*patch_size:chunk_end*patch_size]
+                        x = torch.from_numpy(chunk_data).float().to(self.device)
+                        x = x.unsqueeze(0)  # (1, C, chunk_len)
+                        mask = torch.ones(1, C, dtype=torch.bool).to(self.device)
 
-                    # tokens: (1, S, embed_dim)
-                    all_embeddings[mod] = tokens.cpu().numpy()
+                        with torch.no_grad():
+                            pooled, tokens = self.model(x, mask)
+
+                        # tokens: (1, num_patches_in_chunk, embed_dim)
+                        chunk_embeddings.append(tokens.cpu().numpy())
+
+                    # Concatenate along sequence dimension -> (1, n_patches, embed_dim)
+                    if chunk_embeddings:
+                        all_embeddings[mod] = np.concatenate(chunk_embeddings, axis=1)
+                    else:
+                        all_embeddings[mod] = None
 
                 return all_embeddings
 
