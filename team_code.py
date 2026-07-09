@@ -109,6 +109,9 @@ class SleepFMFeatureExtractor:
                     print(f"Channel groups not found at {SLEEPFM_CHANNEL_GROUPS_PATH}")
                 return
 
+            with open(SLEEPFM_CHANNEL_GROUPS_PATH, 'r') as f:
+                self.channel_groups = json.load(f)
+
             # Import SleepFM model architecture
             repo_root = os.path.dirname(__file__)
             if repo_root not in sys.path:
@@ -177,7 +180,7 @@ class SleepFMFeatureExtractor:
             import h5py
 
             raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
-            
+
             # Only resample if necessary to avoid long waits
             if abs(raw.info['sfreq'] - 128.0) > 0.5:
                 raw.resample(128.0)
