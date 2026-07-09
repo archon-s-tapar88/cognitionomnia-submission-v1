@@ -10,10 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libgomp1 git git-lfs \
     && rm -rf /var/lib/apt/lists/*
 
-## Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+## Include the following line if you have a requirements.txt file.
+RUN pip install -r requirements.txt
 
-## SleepFM weights are included in the repository using Git LFS:
-## sleepfm/checkpoints/model_base/best.pt
+## SleepFM weights are copied from repo via COPY ./ /challenge above
+## Make sure sleepfm/checkpoints/model_base/best.pt exists in your repo
+## Use: git lfs track "sleepfm/checkpoints/model_base/best.pt"
 
 ENV PYTHONPATH=/challenge:$PYTHONPATH
