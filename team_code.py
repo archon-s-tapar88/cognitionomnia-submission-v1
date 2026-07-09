@@ -117,6 +117,11 @@ class SleepFMFeatureExtractor:
 
             with open(SLEEPFM_CONFIG_PATH, 'r') as f:
                 self.model_config = json.load(f)
+            
+            
+            # Import SleepFM model architecture
+            # The model class name is specified in config['model']
+            model_name = self.model_config.get('model', 'SetTransformer')
 
             if not os.path.exists(SLEEPFM_CHANNEL_GROUPS_PATH):
                 if self.verbose:
