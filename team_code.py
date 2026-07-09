@@ -82,19 +82,7 @@ SLEEPFM_CHANNEL_GROUPS_PATH = os.path.join(SLEEPFM_BASE_PATH, 'configs', 'channe
 class SleepFMFeatureExtractor:
     """
     Wrapper around SleepFM for extracting embeddings from challenge EDF files.
-    Handles EDF -> model input -> embedding generation -> temporal aggregation.
-
-    Model input shape: (B, C, S, 640) where:
-      B = batch size (1 for single patient)
-      C = number of channels for this modality
-      S = number of 5-second windows in the recording
-      640 = 5 seconds at 128Hz
-
-    Mask shape: (B, C) boolean, True for valid channels
-
-    Forward returns: (pooled_emb, per_timestep_emb) where:
-      pooled_emb = (B, 128) - patient-level embedding per modality
-      per_timestep_emb = (B, S, 128) - per-window embeddings
+    Handles EDF -> HDF5 conversion, embedding generation, and temporal aggregation.
     """
 
     def __init__(self, verbose=False):
@@ -103,8 +91,6 @@ class SleepFMFeatureExtractor:
         self.model = None
         self.model_config = None
         self.channel_groups = None
-        self.patch_size = 640
-        self.embed_dim = 128
         self._load_model()
 
     def _load_model(self):
@@ -117,11 +103,6 @@ class SleepFMFeatureExtractor:
 
             with open(SLEEPFM_CONFIG_PATH, 'r') as f:
                 self.model_config = json.load(f)
-            
-            
-            # Import SleepFM model architecture
-            # The model class name is specified in config['model']
-            model_name = self.model_config.get('model', 'SetTransformer')
 
             if not os.path.exists(SLEEPFM_CHANNEL_GROUPS_PATH):
                 if self.verbose:
@@ -131,6 +112,10 @@ class SleepFMFeatureExtractor:
             with open(SLEEPFM_CHANNEL_GROUPS_PATH, 'r') as f:
                 self.channel_groups = json.load(f)
 
+            # Import SleepFM model architecture
+            # The model class name is specified in config['model']
+            model_name = self.model_config.get('model', 'SetTransformerContrastive')
+
             # Add repo root to sys.path so 'sleepfm' package is discoverable
             repo_root = os.path.dirname(__file__)
             if repo_root not in sys.path:
@@ -138,23 +123,36 @@ class SleepFMFeatureExtractor:
 
             # Import the real SleepFM model architecture
             try:
-                from sleepfm.models.models import SetTransformer
-                model_class = SetTransformer
+                from sleepfm.models.models import SetTransformerContrastive
+                model_class = SetTransformerContrastive
             except ImportError as e:
-                if self.verbose:
-                    print(f"Could not import SetTransformer: {e}")
-                model_class = self._build_model_inline()
+                print(f"Could not import real SleepFM model: {e}")
+                # Try installing missing deps
+                try:
+                    import subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "loguru", "einops", "timm", "-q"])
+                    from sleepfm.models.models import SetTransformerContrastive
+                    model_class = SetTransformerContrastive
+                except Exception as e2:
+                    print(f"Still failed after install attempt: {e2}")
+                    model_class = self._build_model_inline()
 
-            # Model config values
-            in_channels = self.model_config.get('in_channels', 1)
+            # Instantiate model
+            raw_in_ch = self.model_config.get('in_channels', {
+                'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4
+            })
+            # Handle both int (legacy) and dict formats
+            if isinstance(raw_in_ch, int):
+                in_channels = {'BAS': raw_in_ch, 'RESP': raw_in_ch, 'EKG': raw_in_ch, 'EMG': raw_in_ch}
+            elif isinstance(raw_in_ch, dict):
+                in_channels = raw_in_ch
+            else:
+                in_channels = {'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4}
             patch_size = self.model_config.get('patch_size', 640)
             embed_dim = self.model_config.get('embed_dim', 128)
             num_heads = self.model_config.get('num_heads', 8)
             num_layers = self.model_config.get('num_layers', 6)
-            pooling_head = self.model_config.get('pooling_head', 8)
-
-            self.patch_size = patch_size
-            self.embed_dim = embed_dim
+            pooling_head = self.model_config.get('pooling_head', 'attention')
 
             self.model = model_class(
                 in_channels=in_channels,
@@ -206,30 +204,21 @@ class SleepFMFeatureExtractor:
                 self.pooling_head = pooling_head
                 self.dropout = dropout
 
-                # Simple conv tokenizer
-                self.tokenizer = nn.Sequential(
-                    nn.Conv1d(1, 4, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm1d(4),
-                    nn.ELU(),
-                    nn.Conv1d(4, 8, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm1d(8),
-                    nn.ELU(),
-                    nn.Conv1d(8, 16, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm1d(16),
-                    nn.ELU(),
-                    nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm1d(32),
-                    nn.ELU(),
-                    nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm1d(64),
-                    nn.ELU(),
-                    nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
-                    nn.BatchNorm1d(128),
-                    nn.ELU(),
-                    nn.AdaptiveAvgPool1d(1),
-                    nn.Flatten(),
-                    nn.Linear(128, embed_dim)
-                )
+                # Per-modality encoders
+                self.encoders = nn.ModuleDict()
+                for mod, n_ch in in_channels.items():
+                    layers = []
+                    in_ch = n_ch
+                    out_channels = [4, 8, 16, 32, 64, 128]
+                    for out_ch in out_channels:
+                        layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=5, stride=2, padding=2))
+                        layers.append(nn.BatchNorm1d(out_ch))
+                        layers.append(nn.ELU())
+                        in_ch = out_ch
+                    layers.append(nn.AdaptiveAvgPool1d(1))
+                    layers.append(nn.Flatten())
+                    layers.append(nn.Linear(128, embed_dim))
+                    self.encoders[mod] = nn.Sequential(*layers)
 
                 # Temporal transformer
                 encoder_layer = nn.TransformerEncoderLayer(
@@ -239,117 +228,132 @@ class SleepFMFeatureExtractor:
                 )
                 self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-            def forward(self, x, mask):
-                # x: (B, C, S, L)
+            def forward(self, x, mask=None):
+                # x: (B, C, S, L) where L=patch_size
                 B, C, S, L = x.shape
-                # Process each channel independently: (B*C*S, 1, L)
-                x_flat = x.reshape(B * C * S, 1, L)
-                tokens = self.tokenizer(x_flat)  # (B*C*S, embed_dim)
-                # Reshape to (B, C, S, E)
-                tokens = tokens.reshape(B, C, S, self.embed_dim)
-                # Average across channels
-                tokens = tokens.mean(dim=1)  # (B, S, E)
+                # Reshape for conv1d: (B*S, C, L)
+                x_flat = x.reshape(B * S, C, L)
+                # Determine modality from channel count
+                mod = None
+                for m, n_ch in self.in_channels.items():
+                    if C == n_ch or C <= n_ch:
+                        mod = m
+                        break
+                if mod is None:
+                    mod = 'BAS'
+                # Encode
+                tokens = self.encoders[mod](x_flat)  # (B*S, embed_dim)
+                tokens = tokens.reshape(B, S, self.embed_dim)
                 # Temporal transformer
+                if mask is not None and mask.dim() == 3:
+                    mask = mask.squeeze(1) if mask.shape[1] == 1 else mask[:, 0, :]
                 out = self.temporal_transformer(tokens)
-                # Pool across time
-                pooled = out.mean(dim=1)  # (B, E)
+                # Return (pooled, tokens)
+                pooled = out.mean(dim=1)
                 return pooled, out
 
         return InlineSleepFM
 
-    def _read_edf_channels(self, edf_path):
-        """Read EDF and group channels by SleepFM modality."""
+    def _edf_to_hdf5(self, edf_path, temp_dir):
+        """Convert EDF to SleepFM-compatible HDF5 format."""
         try:
             import mne
+            import h5py
+
             raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
             raw.resample(128.0)
 
-            # Group channels by modality
-            modality_data = {}
-            for mod, channel_list in self.channel_groups.items():
-                matched_signals = []
-                for ch_name in raw.ch_names:
-                    ch_lower = ch_name.lower().replace(' ', '_').replace('-', '_')
-                    for target in channel_list:
-                        target_lower = target.lower().replace('-', '_')
-                        if target_lower in ch_lower or ch_lower in target_lower:
-                            data = raw.get_data(picks=ch_name)[0]
-                            matched_signals.append(data)
-                            break
+            subject_id = os.path.splitext(os.path.basename(edf_path))[0]
+            hdf5_path = os.path.join(temp_dir, f"{subject_id}_psg.hdf5")
 
-                if len(matched_signals) > 0:
-                    # Stack to (C, T)
-                    data_array = np.stack(matched_signals, axis=0)
-                    modality_data[mod] = data_array
+            with h5py.File(hdf5_path, 'w') as f:
+                # Store signals by modality based on channel_groups
+                for mod, channel_list in self.channel_groups.items():
+                    mod_group = f.create_group(mod)
+                    matched_channels = []
+                    matched_data = []
 
-            return modality_data
+                    for ch_name in raw.ch_names:
+                        ch_lower = ch_name.lower().replace(' ', '_').replace('-', '_')
+                        for target in channel_list:
+                            target_lower = target.lower().replace('-', '_')
+                            if target_lower in ch_lower or ch_lower in target_lower:
+                                data = raw.get_data(picks=ch_name)[0]
+                                matched_channels.append(ch_name)
+                                matched_data.append(data)
+                                break
+
+                    if len(matched_data) > 0:
+                        # Stack channels: (C, T)
+                        data_array = np.stack(matched_data, axis=0)
+                        mod_group.create_dataset('data', data=data_array)
+                        mod_group.create_dataset('channels', data=np.array(matched_channels, dtype='S'))
+                        mod_group.attrs['fs'] = 128.0
+
+            return hdf5_path
 
         except Exception as e:
             if self.verbose:
-                print(f"EDF read failed: {e}")
-            return {}
-
-    def _segment_into_patches(self, signal, patch_size=640):
-        """Split signal into non-overlapping 5-second patches."""
-        C, T = signal.shape
-        n_patches = T // patch_size
-        if n_patches == 0:
+                print(f"EDF to HDF5 conversion failed: {e}")
             return None
-        patches = []
-        for i in range(n_patches):
-            patch = signal[:, i*patch_size:(i+1)*patch_size]
-            patches.append(patch)
-        # Stack: (S, C, L) then transpose to (C, S, L)
-        patches = np.stack(patches, axis=0)  # (S, C, L)
-        patches = patches.transpose(1, 0, 2)  # (C, S, L)
-        return patches
 
-def _generate_embeddings(self, modality_data):
-    if self.model is None:
-        return None
+    def _generate_embeddings(self, hdf5_path):
+        """Generate SleepFM embeddings from HDF5 file."""
+        if self.model is None:
+            return None
 
-    all_embeddings = {}
-    chunk_patches = 60  # 5 minutes = 60 * 640 samples
-    chunk_samples = chunk_patches * self.patch_size
+        try:
+            import h5py
 
-    for mod in self.channel_groups.keys():
-        if mod not in modality_data:
-            all_embeddings[mod] = None
-            continue
+            with h5py.File(hdf5_path, 'r') as f:
+                all_embeddings = {}
 
-        signal = modality_data[mod]  # (C, T)
-        C, T = signal.shape
+                for mod in self.channel_groups.keys():
+                    if mod not in f:
+                        all_embeddings[mod] = None
+                        continue
 
-        # Truncate to multiple of chunk size
-        T_trunc = (T // chunk_samples) * chunk_samples
-        if T_trunc == 0:
-            all_embeddings[mod] = None
-            continue
+                    mod_group = f[mod]
+                    if 'data' not in mod_group:
+                        all_embeddings[mod] = None
+                        continue
 
-        signal = signal[:, :T_trunc]
-        n_chunks = T_trunc // chunk_samples
+                    data = mod_group['data'][:]  # (C, T)
+                    fs = mod_group.attrs.get('fs', 128.0)
+                    C, T = data.shape
 
-        # Process each chunk
-        chunk_embeddings = []
-        for i in range(n_chunks):
-            chunk = signal[:, i*chunk_samples:(i+1)*chunk_samples]
-            x = torch.from_numpy(chunk).float().unsqueeze(0).to(self.device)  # (1, C, chunk_samples)
-            mask = torch.ones(1, C, dtype=torch.bool).to(self.device)
+                    # Segment into 5-second patches (640 samples at 128Hz)
+                    patch_size = 640
+                    n_patches = T // patch_size
+                    if n_patches == 0:
+                        all_embeddings[mod] = None
+                        continue
 
-            with torch.no_grad():
-                pooled, _ = self.model(x, mask)
-            chunk_embeddings.append(pooled.cpu().numpy())
+                    patches = []
+                    for i in range(n_patches):
+                        patch = data[:, i*patch_size:(i+1)*patch_size]
+                        patches.append(patch)
 
-        # Average across chunks
-        chunk_embeddings = np.stack(chunk_embeddings, axis=0)  # (n_chunks, 1, 128)
-        mean_embedding = chunk_embeddings.mean(axis=0)[0]  # (128,)
+                    patches = np.stack(patches, axis=0)  # (S, C, L)
+                    patches = torch.from_numpy(patches).float().to(self.device)
+                    patches = patches.permute(1, 0, 2)  # (C, S, L)
+                    patches = patches.unsqueeze(0)  # (1, C, S, L)
 
-        all_embeddings[mod] = {
-            'pooled': mean_embedding.reshape(1, -1),  # (1, 128)
-            'per_chunk': chunk_embeddings  # (n_chunks, 1, 128)
-        }
+                    # Create mask (all valid)
+                    mask = torch.ones(1, C, n_patches, dtype=torch.bool).to(self.device)
 
-    return all_embeddings
+                    with torch.no_grad():
+                        pooled, tokens = self.model(patches, mask)
+
+                    # tokens: (1, S, embed_dim)
+                    all_embeddings[mod] = tokens.cpu().numpy()
+
+                return all_embeddings
+
+        except Exception as e:
+            if self.verbose:
+                print(f"Embedding generation failed: {e}")
+            return None
 
     def extract_features(self, edf_path):
         """
@@ -359,52 +363,60 @@ def _generate_embeddings(self, modality_data):
         if self.model is None:
             return None
 
-        modality_data = self._read_edf_channels(edf_path)
-        if not modality_data:
-            return None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hdf5_path = self._edf_to_hdf5(edf_path, temp_dir)
+            if hdf5_path is None:
+                return None
 
-        embeddings = self._generate_embeddings(modality_data)
-        if embeddings is None:
-            return None
+            embeddings = self._generate_embeddings(hdf5_path)
+            if embeddings is None:
+                return None
 
-        features = {}
+            features = {}
+            for mod in self.channel_groups.keys():
+                emb = embeddings.get(mod)
+                if emb is not None and emb.size > 0:
+                    # emb shape: (1, S, E) where E=embed_dim
+                    emb_mod = emb[0]  # (S, E)
 
-        for mod in self.channel_groups.keys():
-            emb = embeddings.get(mod)
-            if emb is not None:
-                pooled = emb['pooled'][0]  # (128,)
-                per_ts = emb['per_timestep'][0]  # (S, 128)
+                    features[f'sleepfm_{mod}_mean'] = float(np.mean(emb_mod))
+                    features[f'sleepfm_{mod}_std'] = float(np.std(emb_mod))
+                    features[f'sleepfm_{mod}_max'] = float(np.max(emb_mod))
+                    features[f'sleepfm_{mod}_min'] = float(np.min(emb_mod))
+                    features[f'sleepfm_{mod}_median'] = float(np.median(emb_mod))
 
-                # Pooled embedding stats
-                features[f'sleepfm_{mod}_pooled_mean'] = float(pooled.mean())
-                features[f'sleepfm_{mod}_pooled_std'] = float(pooled.std())
-                features[f'sleepfm_{mod}_pooled_max'] = float(pooled.max())
-                features[f'sleepfm_{mod}_pooled_min'] = float(pooled.min())
+                    # Per-dimension statistics (first 8 dims)
+                    n_dims = min(8, emb_mod.shape[1])
+                    for i in range(n_dims):
+                        features[f'sleepfm_{mod}_d{i}_mean'] = float(np.mean(emb_mod[:, i]))
+                        features[f'sleepfm_{mod}_d{i}_std'] = float(np.std(emb_mod[:, i]))
+                        features[f'sleepfm_{mod}_d{i}_max'] = float(np.max(emb_mod[:, i]))
+                        features[f'sleepfm_{mod}_d{i}_min'] = float(np.min(emb_mod[:, i]))
 
-                # Per-timestep stats
-                features[f'sleepfm_{mod}_ts_mean'] = float(per_ts.mean())
-                features[f'sleepfm_{mod}_ts_std'] = float(per_ts.std())
-                features[f'sleepfm_{mod}_ts_max'] = float(per_ts.max())
-                features[f'sleepfm_{mod}_ts_min'] = float(per_ts.min())
+                    # Temporal dynamics
+                    if emb_mod.shape[0] > 1:
+                        features[f'sleepfm_{mod}_temporal_std'] = float(np.std(np.mean(emb_mod, axis=1)))
+                        features[f'sleepfm_{mod}_temporal_range'] = float(
+                            np.max(np.mean(emb_mod, axis=1)) - np.min(np.mean(emb_mod, axis=1))
+                        )
+                    else:
+                        features[f'sleepfm_{mod}_temporal_std'] = 0.0
+                        features[f'sleepfm_{mod}_temporal_range'] = 0.0
+                else:
+                    features[f'sleepfm_{mod}_mean'] = np.nan
+                    features[f'sleepfm_{mod}_std'] = np.nan
+                    features[f'sleepfm_{mod}_max'] = np.nan
+                    features[f'sleepfm_{mod}_min'] = np.nan
+                    features[f'sleepfm_{mod}_median'] = np.nan
+                    for i in range(8):
+                        features[f'sleepfm_{mod}_d{i}_mean'] = np.nan
+                        features[f'sleepfm_{mod}_d{i}_std'] = np.nan
+                        features[f'sleepfm_{mod}_d{i}_max'] = np.nan
+                        features[f'sleepfm_{mod}_d{i}_min'] = np.nan
+                    features[f'sleepfm_{mod}_temporal_std'] = np.nan
+                    features[f'sleepfm_{mod}_temporal_range'] = np.nan
 
-                # Temporal dynamics
-                ts_mean_per_window = per_ts.mean(axis=1)  # (S,)
-                features[f'sleepfm_{mod}_temporal_std'] = float(ts_mean_per_window.std())
-                features[f'sleepfm_{mod}_temporal_range'] = float(ts_mean_per_window.max() - ts_mean_per_window.min())
-
-                # Per-dimension stats (first 8 dims of pooled)
-                for i in range(min(8, pooled.shape[0])):
-                    features[f'sleepfm_{mod}_d{i}'] = float(pooled[i])
-            else:
-                # Missing modality - fill with NaN
-                for prefix in ['pooled_mean', 'pooled_std', 'pooled_max', 'pooled_min',
-                               'ts_mean', 'ts_std', 'ts_max', 'ts_min',
-                               'temporal_std', 'temporal_range']:
-                    features[f'sleepfm_{mod}_{prefix}'] = np.nan
-                for i in range(8):
-                    features[f'sleepfm_{mod}_d{i}'] = np.nan
-
-        return features
+            return features
 
 
 # =============================================================================
@@ -1112,6 +1124,8 @@ def _make_fresh_model(name):
         raise ValueError(f"Unknown model name: {name}")
 
 
+
+
 # #!/usr/bin/env python
 
 # # Edit this script to add your team's code. Some functions are *required*, but you can edit most parts of the required functions,
@@ -1196,7 +1210,19 @@ def _make_fresh_model(name):
 # class SleepFMFeatureExtractor:
 #     """
 #     Wrapper around SleepFM for extracting embeddings from challenge EDF files.
-#     Handles EDF -> HDF5 conversion, embedding generation, and temporal aggregation.
+#     Handles EDF -> model input -> embedding generation -> temporal aggregation.
+
+#     Model input shape: (B, C, S, 640) where:
+#       B = batch size (1 for single patient)
+#       C = number of channels for this modality
+#       S = number of 5-second windows in the recording
+#       640 = 5 seconds at 128Hz
+
+#     Mask shape: (B, C) boolean, True for valid channels
+
+#     Forward returns: (pooled_emb, per_timestep_emb) where:
+#       pooled_emb = (B, 128) - patient-level embedding per modality
+#       per_timestep_emb = (B, S, 128) - per-window embeddings
 #     """
 
 #     def __init__(self, verbose=False):
@@ -1205,6 +1231,8 @@ def _make_fresh_model(name):
 #         self.model = None
 #         self.model_config = None
 #         self.channel_groups = None
+#         self.patch_size = 640
+#         self.embed_dim = 128
 #         self._load_model()
 
 #     def _load_model(self):
@@ -1217,6 +1245,11 @@ def _make_fresh_model(name):
 
 #             with open(SLEEPFM_CONFIG_PATH, 'r') as f:
 #                 self.model_config = json.load(f)
+            
+            
+#             # Import SleepFM model architecture
+#             # The model class name is specified in config['model']
+#             model_name = self.model_config.get('model', 'SetTransformer')
 
 #             if not os.path.exists(SLEEPFM_CHANNEL_GROUPS_PATH):
 #                 if self.verbose:
@@ -1226,10 +1259,6 @@ def _make_fresh_model(name):
 #             with open(SLEEPFM_CHANNEL_GROUPS_PATH, 'r') as f:
 #                 self.channel_groups = json.load(f)
 
-#             # Import SleepFM model architecture
-#             # The model class name is specified in config['model']
-#             model_name = self.model_config.get('model', 'SetTransformerContrastive')
-
 #             # Add repo root to sys.path so 'sleepfm' package is discoverable
 #             repo_root = os.path.dirname(__file__)
 #             if repo_root not in sys.path:
@@ -1237,36 +1266,23 @@ def _make_fresh_model(name):
 
 #             # Import the real SleepFM model architecture
 #             try:
-#                 from sleepfm.models.models import SetTransformerContrastive
-#                 model_class = SetTransformerContrastive
+#                 from sleepfm.models.models import SetTransformer
+#                 model_class = SetTransformer
 #             except ImportError as e:
-#                 print(f"Could not import real SleepFM model: {e}")
-#                 # Try installing missing deps
-#                 try:
-#                     import subprocess
-#                     subprocess.check_call([sys.executable, "-m", "pip", "install", "loguru", "einops", "timm", "-q"])
-#                     from sleepfm.models.models import SetTransformerContrastive
-#                     model_class = SetTransformerContrastive
-#                 except Exception as e2:
-#                     print(f"Still failed after install attempt: {e2}")
-#                     model_class = self._build_model_inline()
+#                 if self.verbose:
+#                     print(f"Could not import SetTransformer: {e}")
+#                 model_class = self._build_model_inline()
 
-#             # Instantiate model
-#             raw_in_ch = self.model_config.get('in_channels', {
-#                 'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4
-#             })
-#             # Handle both int (legacy) and dict formats
-#             if isinstance(raw_in_ch, int):
-#                 in_channels = {'BAS': raw_in_ch, 'RESP': raw_in_ch, 'EKG': raw_in_ch, 'EMG': raw_in_ch}
-#             elif isinstance(raw_in_ch, dict):
-#                 in_channels = raw_in_ch
-#             else:
-#                 in_channels = {'BAS': 10, 'RESP': 7, 'EKG': 2, 'EMG': 4}
+#             # Model config values
+#             in_channels = self.model_config.get('in_channels', 1)
 #             patch_size = self.model_config.get('patch_size', 640)
 #             embed_dim = self.model_config.get('embed_dim', 128)
 #             num_heads = self.model_config.get('num_heads', 8)
 #             num_layers = self.model_config.get('num_layers', 6)
-#             pooling_head = self.model_config.get('pooling_head', 'attention')
+#             pooling_head = self.model_config.get('pooling_head', 8)
+
+#             self.patch_size = patch_size
+#             self.embed_dim = embed_dim
 
 #             self.model = model_class(
 #                 in_channels=in_channels,
@@ -1318,21 +1334,30 @@ def _make_fresh_model(name):
 #                 self.pooling_head = pooling_head
 #                 self.dropout = dropout
 
-#                 # Per-modality encoders
-#                 self.encoders = nn.ModuleDict()
-#                 for mod, n_ch in in_channels.items():
-#                     layers = []
-#                     in_ch = n_ch
-#                     out_channels = [4, 8, 16, 32, 64, 128]
-#                     for out_ch in out_channels:
-#                         layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=5, stride=2, padding=2))
-#                         layers.append(nn.BatchNorm1d(out_ch))
-#                         layers.append(nn.ELU())
-#                         in_ch = out_ch
-#                     layers.append(nn.AdaptiveAvgPool1d(1))
-#                     layers.append(nn.Flatten())
-#                     layers.append(nn.Linear(128, embed_dim))
-#                     self.encoders[mod] = nn.Sequential(*layers)
+#                 # Simple conv tokenizer
+#                 self.tokenizer = nn.Sequential(
+#                     nn.Conv1d(1, 4, kernel_size=5, stride=2, padding=2),
+#                     nn.BatchNorm1d(4),
+#                     nn.ELU(),
+#                     nn.Conv1d(4, 8, kernel_size=5, stride=2, padding=2),
+#                     nn.BatchNorm1d(8),
+#                     nn.ELU(),
+#                     nn.Conv1d(8, 16, kernel_size=5, stride=2, padding=2),
+#                     nn.BatchNorm1d(16),
+#                     nn.ELU(),
+#                     nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2),
+#                     nn.BatchNorm1d(32),
+#                     nn.ELU(),
+#                     nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
+#                     nn.BatchNorm1d(64),
+#                     nn.ELU(),
+#                     nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+#                     nn.BatchNorm1d(128),
+#                     nn.ELU(),
+#                     nn.AdaptiveAvgPool1d(1),
+#                     nn.Flatten(),
+#                     nn.Linear(128, embed_dim)
+#                 )
 
 #                 # Temporal transformer
 #                 encoder_layer = nn.TransformerEncoderLayer(
@@ -1342,132 +1367,117 @@ def _make_fresh_model(name):
 #                 )
 #                 self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-#             def forward(self, x, mask=None):
-#                 # x: (B, C, S, L) where L=patch_size
+#             def forward(self, x, mask):
+#                 # x: (B, C, S, L)
 #                 B, C, S, L = x.shape
-#                 # Reshape for conv1d: (B*S, C, L)
-#                 x_flat = x.reshape(B * S, C, L)
-#                 # Determine modality from channel count
-#                 mod = None
-#                 for m, n_ch in self.in_channels.items():
-#                     if C == n_ch or C <= n_ch:
-#                         mod = m
-#                         break
-#                 if mod is None:
-#                     mod = 'BAS'
-#                 # Encode
-#                 tokens = self.encoders[mod](x_flat)  # (B*S, embed_dim)
-#                 tokens = tokens.reshape(B, S, self.embed_dim)
+#                 # Process each channel independently: (B*C*S, 1, L)
+#                 x_flat = x.reshape(B * C * S, 1, L)
+#                 tokens = self.tokenizer(x_flat)  # (B*C*S, embed_dim)
+#                 # Reshape to (B, C, S, E)
+#                 tokens = tokens.reshape(B, C, S, self.embed_dim)
+#                 # Average across channels
+#                 tokens = tokens.mean(dim=1)  # (B, S, E)
 #                 # Temporal transformer
-#                 if mask is not None and mask.dim() == 3:
-#                     mask = mask.squeeze(1) if mask.shape[1] == 1 else mask[:, 0, :]
 #                 out = self.temporal_transformer(tokens)
-#                 # Return (pooled, tokens)
-#                 pooled = out.mean(dim=1)
+#                 # Pool across time
+#                 pooled = out.mean(dim=1)  # (B, E)
 #                 return pooled, out
 
 #         return InlineSleepFM
 
-#     def _edf_to_hdf5(self, edf_path, temp_dir):
-#         """Convert EDF to SleepFM-compatible HDF5 format."""
+#     def _read_edf_channels(self, edf_path):
+#         """Read EDF and group channels by SleepFM modality."""
 #         try:
 #             import mne
-#             import h5py
-
 #             raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 #             raw.resample(128.0)
 
-#             subject_id = os.path.splitext(os.path.basename(edf_path))[0]
-#             hdf5_path = os.path.join(temp_dir, f"{subject_id}_psg.hdf5")
+#             # Group channels by modality
+#             modality_data = {}
+#             for mod, channel_list in self.channel_groups.items():
+#                 matched_signals = []
+#                 for ch_name in raw.ch_names:
+#                     ch_lower = ch_name.lower().replace(' ', '_').replace('-', '_')
+#                     for target in channel_list:
+#                         target_lower = target.lower().replace('-', '_')
+#                         if target_lower in ch_lower or ch_lower in target_lower:
+#                             data = raw.get_data(picks=ch_name)[0]
+#                             matched_signals.append(data)
+#                             break
 
-#             with h5py.File(hdf5_path, 'w') as f:
-#                 # Store signals by modality based on channel_groups
-#                 for mod, channel_list in self.channel_groups.items():
-#                     mod_group = f.create_group(mod)
-#                     matched_channels = []
-#                     matched_data = []
+#                 if len(matched_signals) > 0:
+#                     # Stack to (C, T)
+#                     data_array = np.stack(matched_signals, axis=0)
+#                     modality_data[mod] = data_array
 
-#                     for ch_name in raw.ch_names:
-#                         ch_lower = ch_name.lower().replace(' ', '_').replace('-', '_')
-#                         for target in channel_list:
-#                             target_lower = target.lower().replace('-', '_')
-#                             if target_lower in ch_lower or ch_lower in target_lower:
-#                                 data = raw.get_data(picks=ch_name)[0]
-#                                 matched_channels.append(ch_name)
-#                                 matched_data.append(data)
-#                                 break
-
-#                     if len(matched_data) > 0:
-#                         # Stack channels: (C, T)
-#                         data_array = np.stack(matched_data, axis=0)
-#                         mod_group.create_dataset('data', data=data_array)
-#                         mod_group.create_dataset('channels', data=np.array(matched_channels, dtype='S'))
-#                         mod_group.attrs['fs'] = 128.0
-
-#             return hdf5_path
+#             return modality_data
 
 #         except Exception as e:
 #             if self.verbose:
-#                 print(f"EDF to HDF5 conversion failed: {e}")
+#                 print(f"EDF read failed: {e}")
+#             return {}
+
+#     def _segment_into_patches(self, signal, patch_size=640):
+#         """Split signal into non-overlapping 5-second patches."""
+#         C, T = signal.shape
+#         n_patches = T // patch_size
+#         if n_patches == 0:
 #             return None
+#         patches = []
+#         for i in range(n_patches):
+#             patch = signal[:, i*patch_size:(i+1)*patch_size]
+#             patches.append(patch)
+#         # Stack: (S, C, L) then transpose to (C, S, L)
+#         patches = np.stack(patches, axis=0)  # (S, C, L)
+#         patches = patches.transpose(1, 0, 2)  # (C, S, L)
+#         return patches
 
-#     def _generate_embeddings(self, hdf5_path):
-#         """Generate SleepFM embeddings from HDF5 file."""
-#         if self.model is None:
-#             return None
+# def _generate_embeddings(self, modality_data):
+#     if self.model is None:
+#         return None
 
-#         try:
-#             import h5py
+#     all_embeddings = {}
+#     chunk_patches = 60  # 5 minutes = 60 * 640 samples
+#     chunk_samples = chunk_patches * self.patch_size
 
-#             with h5py.File(hdf5_path, 'r') as f:
-#                 all_embeddings = {}
+#     for mod in self.channel_groups.keys():
+#         if mod not in modality_data:
+#             all_embeddings[mod] = None
+#             continue
 
-#                 for mod in self.channel_groups.keys():
-#                     if mod not in f:
-#                         all_embeddings[mod] = None
-#                         continue
+#         signal = modality_data[mod]  # (C, T)
+#         C, T = signal.shape
 
-#                     mod_group = f[mod]
-#                     if 'data' not in mod_group:
-#                         all_embeddings[mod] = None
-#                         continue
+#         # Truncate to multiple of chunk size
+#         T_trunc = (T // chunk_samples) * chunk_samples
+#         if T_trunc == 0:
+#             all_embeddings[mod] = None
+#             continue
 
-#                     data = mod_group['data'][:]  # (C, T)
-#                     fs = mod_group.attrs.get('fs', 128.0)
-#                     C, T = data.shape
+#         signal = signal[:, :T_trunc]
+#         n_chunks = T_trunc // chunk_samples
 
-#                     # Segment into 5-second patches (640 samples at 128Hz)
-#                     patch_size = 640
-#                     n_patches = T // patch_size
-#                     if n_patches == 0:
-#                         all_embeddings[mod] = None
-#                         continue
+#         # Process each chunk
+#         chunk_embeddings = []
+#         for i in range(n_chunks):
+#             chunk = signal[:, i*chunk_samples:(i+1)*chunk_samples]
+#             x = torch.from_numpy(chunk).float().unsqueeze(0).to(self.device)  # (1, C, chunk_samples)
+#             mask = torch.ones(1, C, dtype=torch.bool).to(self.device)
 
-#                     patches = []
-#                     for i in range(n_patches):
-#                         patch = data[:, i*patch_size:(i+1)*patch_size]
-#                         patches.append(patch)
+#             with torch.no_grad():
+#                 pooled, _ = self.model(x, mask)
+#             chunk_embeddings.append(pooled.cpu().numpy())
 
-#                     patches = np.stack(patches, axis=0)  # (S, C, L)
-#                     patches = torch.from_numpy(patches).float().to(self.device)
-#                     patches = patches.permute(1, 0, 2)  # (C, S, L)
-#                     patches = patches.unsqueeze(0)  # (1, C, S, L)
+#         # Average across chunks
+#         chunk_embeddings = np.stack(chunk_embeddings, axis=0)  # (n_chunks, 1, 128)
+#         mean_embedding = chunk_embeddings.mean(axis=0)[0]  # (128,)
 
-#                     # Create mask (all valid)
-#                     mask = torch.ones(1, C, n_patches, dtype=torch.bool).to(self.device)
+#         all_embeddings[mod] = {
+#             'pooled': mean_embedding.reshape(1, -1),  # (1, 128)
+#             'per_chunk': chunk_embeddings  # (n_chunks, 1, 128)
+#         }
 
-#                     with torch.no_grad():
-#                         pooled, tokens = self.model(patches, mask)
-
-#                     # tokens: (1, S, embed_dim)
-#                     all_embeddings[mod] = tokens.cpu().numpy()
-
-#                 return all_embeddings
-
-#         except Exception as e:
-#             if self.verbose:
-#                 print(f"Embedding generation failed: {e}")
-#             return None
+#     return all_embeddings
 
 #     def extract_features(self, edf_path):
 #         """
@@ -1477,60 +1487,52 @@ def _make_fresh_model(name):
 #         if self.model is None:
 #             return None
 
-#         with tempfile.TemporaryDirectory() as temp_dir:
-#             hdf5_path = self._edf_to_hdf5(edf_path, temp_dir)
-#             if hdf5_path is None:
-#                 return None
+#         modality_data = self._read_edf_channels(edf_path)
+#         if not modality_data:
+#             return None
 
-#             embeddings = self._generate_embeddings(hdf5_path)
-#             if embeddings is None:
-#                 return None
+#         embeddings = self._generate_embeddings(modality_data)
+#         if embeddings is None:
+#             return None
 
-#             features = {}
-#             for mod in self.channel_groups.keys():
-#                 emb = embeddings.get(mod)
-#                 if emb is not None and emb.size > 0:
-#                     # emb shape: (1, S, E) where E=embed_dim
-#                     emb_mod = emb[0]  # (S, E)
+#         features = {}
 
-#                     features[f'sleepfm_{mod}_mean'] = float(np.mean(emb_mod))
-#                     features[f'sleepfm_{mod}_std'] = float(np.std(emb_mod))
-#                     features[f'sleepfm_{mod}_max'] = float(np.max(emb_mod))
-#                     features[f'sleepfm_{mod}_min'] = float(np.min(emb_mod))
-#                     features[f'sleepfm_{mod}_median'] = float(np.median(emb_mod))
+#         for mod in self.channel_groups.keys():
+#             emb = embeddings.get(mod)
+#             if emb is not None:
+#                 pooled = emb['pooled'][0]  # (128,)
+#                 per_ts = emb['per_timestep'][0]  # (S, 128)
 
-#                     # Per-dimension statistics (first 8 dims)
-#                     n_dims = min(8, emb_mod.shape[1])
-#                     for i in range(n_dims):
-#                         features[f'sleepfm_{mod}_d{i}_mean'] = float(np.mean(emb_mod[:, i]))
-#                         features[f'sleepfm_{mod}_d{i}_std'] = float(np.std(emb_mod[:, i]))
-#                         features[f'sleepfm_{mod}_d{i}_max'] = float(np.max(emb_mod[:, i]))
-#                         features[f'sleepfm_{mod}_d{i}_min'] = float(np.min(emb_mod[:, i]))
+#                 # Pooled embedding stats
+#                 features[f'sleepfm_{mod}_pooled_mean'] = float(pooled.mean())
+#                 features[f'sleepfm_{mod}_pooled_std'] = float(pooled.std())
+#                 features[f'sleepfm_{mod}_pooled_max'] = float(pooled.max())
+#                 features[f'sleepfm_{mod}_pooled_min'] = float(pooled.min())
 
-#                     # Temporal dynamics
-#                     if emb_mod.shape[0] > 1:
-#                         features[f'sleepfm_{mod}_temporal_std'] = float(np.std(np.mean(emb_mod, axis=1)))
-#                         features[f'sleepfm_{mod}_temporal_range'] = float(
-#                             np.max(np.mean(emb_mod, axis=1)) - np.min(np.mean(emb_mod, axis=1))
-#                         )
-#                     else:
-#                         features[f'sleepfm_{mod}_temporal_std'] = 0.0
-#                         features[f'sleepfm_{mod}_temporal_range'] = 0.0
-#                 else:
-#                     features[f'sleepfm_{mod}_mean'] = np.nan
-#                     features[f'sleepfm_{mod}_std'] = np.nan
-#                     features[f'sleepfm_{mod}_max'] = np.nan
-#                     features[f'sleepfm_{mod}_min'] = np.nan
-#                     features[f'sleepfm_{mod}_median'] = np.nan
-#                     for i in range(8):
-#                         features[f'sleepfm_{mod}_d{i}_mean'] = np.nan
-#                         features[f'sleepfm_{mod}_d{i}_std'] = np.nan
-#                         features[f'sleepfm_{mod}_d{i}_max'] = np.nan
-#                         features[f'sleepfm_{mod}_d{i}_min'] = np.nan
-#                     features[f'sleepfm_{mod}_temporal_std'] = np.nan
-#                     features[f'sleepfm_{mod}_temporal_range'] = np.nan
+#                 # Per-timestep stats
+#                 features[f'sleepfm_{mod}_ts_mean'] = float(per_ts.mean())
+#                 features[f'sleepfm_{mod}_ts_std'] = float(per_ts.std())
+#                 features[f'sleepfm_{mod}_ts_max'] = float(per_ts.max())
+#                 features[f'sleepfm_{mod}_ts_min'] = float(per_ts.min())
 
-#             return features
+#                 # Temporal dynamics
+#                 ts_mean_per_window = per_ts.mean(axis=1)  # (S,)
+#                 features[f'sleepfm_{mod}_temporal_std'] = float(ts_mean_per_window.std())
+#                 features[f'sleepfm_{mod}_temporal_range'] = float(ts_mean_per_window.max() - ts_mean_per_window.min())
+
+#                 # Per-dimension stats (first 8 dims of pooled)
+#                 for i in range(min(8, pooled.shape[0])):
+#                     features[f'sleepfm_{mod}_d{i}'] = float(pooled[i])
+#             else:
+#                 # Missing modality - fill with NaN
+#                 for prefix in ['pooled_mean', 'pooled_std', 'pooled_max', 'pooled_min',
+#                                'ts_mean', 'ts_std', 'ts_max', 'ts_min',
+#                                'temporal_std', 'temporal_range']:
+#                     features[f'sleepfm_{mod}_{prefix}'] = np.nan
+#                 for i in range(8):
+#                     features[f'sleepfm_{mod}_d{i}'] = np.nan
+
+#         return features
 
 
 # # =============================================================================
@@ -2236,3 +2238,5 @@ def _make_fresh_model(name):
 #         return VotingClassifier(estimators=estimators, voting='soft', n_jobs=1)
 #     else:
 #         raise ValueError(f"Unknown model name: {name}")
+
+
