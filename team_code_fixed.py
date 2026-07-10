@@ -1,5 +1,19 @@
 #!/usr/bin/env python
 
+# Edit this script to add your team's code. Some functions are *required*, but you can edit most parts of the required functions,
+# change or remove non-required functions, and add your own functions.
+
+"""
+PhysioNet Challenge 2026- V2 with SleepFM Transfer Learning
+Targets: Age-Conditioned AUROC + Prevalence Reward
+
+Integrates SleepFM foundation model embeddings with existing hand-crafted features.
+SleepFM: A multimodal sleep foundation model trained on 585,000+ hours of PSG data
+from 65,000+ participants (Thapa et al., Nature Medicine 2026).
+Pretraining data: Stanford Sleep Clinic, BioSerenity, MESA, MrOS.
+License: CC BY-NC 4.0
+"""
+
 import os
 import sys
 import warnings
@@ -11,37 +25,65 @@ import scipy.stats
 from tqdm import tqdm
 import joblib
 
+# Core ML
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.ensemble import StackingClassifier, VotingClassifier
 from sklearn.svm import SVC
+from sklearn.model_selection import StratifiedKFold
 
+# LightGBM (best tree model from LOSO)
 try:
     import lightgbm as lgb
 except ImportError:
     lgb = None
 
+# PyTorch for SleepFM
 import torch
 import torch.nn as nn
 
 warnings.filterwarnings("ignore")
 from helper_code import *
 
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Model selection strategy:
+# "auto"   = internal LOSO-style CV selects best model per-site
+# "logistic" = force Logistic Regression (C=0.5, best on I0002)
+# "lightgbm" = force LightGBM (best tree on I0006)
+# "stack"    = force Linear Stack (best overall s_C: 0.7511)
+# "mega"     = average ensemble of logistic + lightgbm + stack
 FINAL_MODEL = "auto"
+
+# number of CV folds for internal model selection
 N_CV_FOLDS = 5
+
+# window names for temporal feature extraction
 WINDOWS = ['early', 'mid', 'late']
+
+# EEG spectral metrics
 EEG_METRICS = ['delta','theta','alpha','sigma','beta','alpha_theta',
                'theta_beta','slowing','delta_sigma','entropy','sef50','sef90']
 
+# SleepFM configuration
 SLEEPFM_BASE_PATH = os.path.join(os.path.dirname(__file__), 'sleepfm')
 SLEEPFM_MODEL_PATH = os.path.join(SLEEPFM_BASE_PATH, 'checkpoints', 'model_base')
 SLEEPFM_CONFIG_PATH = os.path.join(SLEEPFM_MODEL_PATH, 'config.json')
 SLEEPFM_CHANNEL_GROUPS_PATH = os.path.join(SLEEPFM_BASE_PATH, 'configs', 'channel_groups_challenge.json')
 
+# =============================================================================
+# SLEEPFM INTEGRATION
+# =============================================================================
 
 class SleepFMFeatureExtractor:
-    """SleepFM extractor with memory-safe EDF handling."""
+    """
+    Wrapper around SleepFM for extracting embeddings from challenge EDF files.
+    Handles EDF -> HDF5 conversion, embedding generation, and temporal aggregation.
+    """
 
     def __init__(self, verbose=False):
         self.verbose = verbose
@@ -70,6 +112,7 @@ class SleepFMFeatureExtractor:
             with open(SLEEPFM_CHANNEL_GROUPS_PATH, 'r') as f:
                 self.channel_groups = json.load(f)
 
+            # Import SleepFM model architecture
             repo_root = os.path.dirname(__file__)
             if repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
@@ -83,6 +126,7 @@ class SleepFMFeatureExtractor:
                 self.model = None
                 return
 
+            # Load config parameters
             in_channels = self.model_config.get('in_channels', 1)
             patch_size = self.model_config.get('patch_size', 640)
             embed_dim = self.model_config.get('embed_dim', 128)
@@ -102,6 +146,7 @@ class SleepFMFeatureExtractor:
                 max_seq_length=128
             )
 
+            # Load weights
             weights_path = os.path.join(SLEEPFM_MODEL_PATH, 'best.pt')
             if not os.path.exists(weights_path):
                 if self.verbose:
@@ -112,6 +157,7 @@ class SleepFMFeatureExtractor:
             checkpoint = torch.load(weights_path, map_location=self.device)
             state_dict = checkpoint.get('state_dict', checkpoint)
 
+            # Handle DataParallel prefix
             if len(state_dict) > 0 and next(iter(state_dict)).startswith('module.'):
                 state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
 
@@ -128,15 +174,14 @@ class SleepFMFeatureExtractor:
             self.model = None
 
     def _edf_to_hdf5(self, edf_path, temp_dir):
-        """Convert EDF to HDF5 WITHOUT loading entire file into memory."""
+        """Convert EDF to SleepFM-compatible HDF5 format."""
         try:
             import mne
             import h5py
 
-            # CRITICAL: preload=False means header only
-            raw = mne.io.read_raw_edf(edf_path, preload=False, verbose=False)
+            raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
-            # Resample in-place (affects header, not full load)
+            # Only resample if necessary to avoid long waits
             if abs(raw.info['sfreq'] - 128.0) > 0.5:
                 raw.resample(128.0)
 
@@ -144,6 +189,7 @@ class SleepFMFeatureExtractor:
             hdf5_path = os.path.join(temp_dir, f"{subject_id}_psg.hdf5")
 
             with h5py.File(hdf5_path, 'w') as f:
+                # Store signals by modality based on channel_groups
                 for mod, channel_list in self.channel_groups.items():
                     mod_group = f.create_group(mod)
                     matched_channels = []
@@ -154,20 +200,17 @@ class SleepFMFeatureExtractor:
                         for target in channel_list:
                             target_lower = target.lower().replace('-', '_')
                             if target_lower in ch_lower or ch_lower in target_lower:
-                                # Load only this ONE channel from disk
                                 data = raw.get_data(picks=ch_name)[0]
                                 matched_channels.append(ch_name)
                                 matched_data.append(data)
                                 break
 
                     if len(matched_data) > 0:
+                        # Stack channels: (C, T)
                         data_array = np.stack(matched_data, axis=0)
                         mod_group.create_dataset('data', data=data_array)
                         mod_group.create_dataset('channels', data=np.array(matched_channels, dtype='S'))
                         mod_group.attrs['fs'] = 128.0
-                        
-                        # Free immediately
-                        del matched_data, data_array
 
             return hdf5_path
 
@@ -177,7 +220,7 @@ class SleepFMFeatureExtractor:
             return None
 
     def _generate_embeddings(self, hdf5_path):
-        """Generate embeddings by streaming HDF5 chunks."""
+        """Generate SleepFM embeddings from HDF5 file with streaming to avoid OOM."""
         if self.model is None:
             return None
 
@@ -197,8 +240,9 @@ class SleepFMFeatureExtractor:
                         all_embeddings[mod] = None
                         continue
 
-                    # Stream from h5py - don't load entire dataset
-                    dataset = mod_group['data']
+                    # CRITICAL FIX: DO NOT load entire dataset into RAM
+                    # Instead, keep as h5py dataset reference and stream chunks
+                    dataset = mod_group['data']  # (C, T) but NOT in RAM
                     C, T = dataset.shape
 
                     patch_size = 640
@@ -207,7 +251,8 @@ class SleepFMFeatureExtractor:
                         all_embeddings[mod] = None
                         continue
 
-                    max_patches_per_chunk = 128
+                    # Process in temporal chunks to prevent memory spike
+                    max_patches_per_chunk = 128  # ~5 min at 128 Hz
                     chunk_embeddings = []
 
                     for chunk_start in range(0, n_patches, max_patches_per_chunk):
@@ -215,18 +260,22 @@ class SleepFMFeatureExtractor:
                         chunk_samples_start = chunk_start * patch_size
                         chunk_samples_end = chunk_end * patch_size
 
-                        # Stream only this chunk
+                        # Stream ONLY this chunk from disk
                         chunk_data = dataset[:, chunk_samples_start:chunk_samples_end]
                         x = torch.from_numpy(chunk_data).float().to(self.device)
-                        x = x.unsqueeze(0)
+                        x = x.unsqueeze(0)  # (1, C, chunk_len)
                         mask = torch.ones(1, C, dtype=torch.bool).to(self.device)
 
                         with torch.no_grad():
                             pooled, tokens = self.model(x, mask)
 
+                        # tokens: (1, num_patches_in_chunk, embed_dim)
                         chunk_embeddings.append(tokens.cpu().numpy())
+                        
+                        # Explicitly free GPU/CPU memory
                         del x, mask, tokens, pooled, chunk_data
 
+                    # Concatenate along sequence dimension -> (1, n_patches, embed_dim)
                     if chunk_embeddings:
                         all_embeddings[mod] = np.concatenate(chunk_embeddings, axis=1)
                     else:
@@ -240,7 +289,10 @@ class SleepFMFeatureExtractor:
             return None
 
     def extract_features(self, edf_path):
-        """Main entry point: EDF -> features."""
+        """
+        Main entry point: EDF file -> SleepFM feature vector.
+        Returns dict of features or None if failed.
+        """
         if self.model is None:
             return None
 
@@ -257,7 +309,8 @@ class SleepFMFeatureExtractor:
             for mod in self.channel_groups.keys():
                 emb = embeddings.get(mod)
                 if emb is not None and emb.size > 0:
-                    emb_mod = emb[0]
+                    # emb shape: (1, S, E) where E=embed_dim
+                    emb_mod = emb[0]  # (S, E)
 
                     features[f'sleepfm_{mod}_mean'] = float(np.mean(emb_mod))
                     features[f'sleepfm_{mod}_std'] = float(np.std(emb_mod))
@@ -265,6 +318,7 @@ class SleepFMFeatureExtractor:
                     features[f'sleepfm_{mod}_min'] = float(np.min(emb_mod))
                     features[f'sleepfm_{mod}_median'] = float(np.median(emb_mod))
 
+                    # Per-dimension statistics (first 8 dims)
                     n_dims = min(8, emb_mod.shape[1])
                     for i in range(n_dims):
                         features[f'sleepfm_{mod}_d{i}_mean'] = float(np.mean(emb_mod[:, i]))
@@ -272,6 +326,7 @@ class SleepFMFeatureExtractor:
                         features[f'sleepfm_{mod}_d{i}_max'] = float(np.max(emb_mod[:, i]))
                         features[f'sleepfm_{mod}_d{i}_min'] = float(np.min(emb_mod[:, i]))
 
+                    # Temporal dynamics
                     if emb_mod.shape[0] > 1:
                         features[f'sleepfm_{mod}_temporal_std'] = float(np.std(np.mean(emb_mod, axis=1)))
                         features[f'sleepfm_{mod}_temporal_range'] = float(
@@ -297,10 +352,20 @@ class SleepFMFeatureExtractor:
             return features
 
 
+# =============================================================================
+# REQUIRED FUNCTIONS (DO NOT CHANGE SIGNATURES)
+# =============================================================================
+
 def train_model(data_folder, model_folder, verbose):
+    """
+    Train model on official challenge data.
+    Uses site-aware LOSO CV for model selection to match hidden test conditions.
+    Integrates SleepFM embeddings with hand-crafted features.
+    """
     if verbose:
         print('Finding Challenge data...')
 
+    # Initialize SleepFM feature extractor
     sleepfm_extractor = SleepFMFeatureExtractor(verbose=verbose)
     use_sleepfm = (sleepfm_extractor.model is not None)
 
@@ -320,6 +385,7 @@ def train_model(data_folder, model_folder, verbose):
     if verbose:
         print(f'Found {num_records} records. Extracting features...')
 
+    # PHASE 1: Extract features from all records
     all_features, all_labels, all_ages, all_sites = [], [], [], []
 
     pbar = tqdm(range(num_records), desc="Extract", unit="rec", disable=not verbose)
@@ -336,6 +402,7 @@ def train_model(data_folder, model_folder, verbose):
             patient_data = load_demographics(patient_data_file, patient_id, session_id)
             feats = extract_all_features(data_folder, patient_id, site_id, session_id, patient_data)
 
+            # Extract SleepFM features
             if use_sleepfm:
                 physio_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
                                            site_id, f"{patient_id}_ses-{session_id}.edf")
@@ -373,6 +440,7 @@ def train_model(data_folder, model_folder, verbose):
         print(f"Extracted {len(df)} records, {len(feature_names)} raw features.")
         print(f"Prevalence: {np.mean(all_labels):.3f} | Sites: {df['site'].nunique()}")
 
+    # PHASE 2: Poison filtering (site-directionality tolerance)
     if verbose:
         print('Filtering site-poisonous features...')
 
@@ -401,6 +469,7 @@ def train_model(data_folder, model_folder, verbose):
     if verbose:
         print(f"  Kept {len(kept)} | Dropped {len(poison_features)} poison")
 
+    # PHASE 3: Build interaction features
     interactions = [
         ('resp_caisr_ahi', 'physio_late_spo2_drop', 'inter_AHI_SpO2'),
         ('caisr_prob_w_mean', 'physio_early_eeg_delta', 'inter_WASO_SWA'),
@@ -415,6 +484,7 @@ def train_model(data_folder, model_folder, verbose):
             df[name] = df[f1] * df[f2]
             kept.append(name)
 
+    # PHASE 4: Age residualization
     if verbose:
         print('Age-residualizing features...')
 
@@ -429,6 +499,7 @@ def train_model(data_folder, model_folder, verbose):
             resid_cols.append(f"{col}_resid")
             age_resid_models[col] = lr
 
+    # PHASE 5: Impute & scale
     for col in resid_cols:
         med = df[col].median()
         if np.isnan(med):
@@ -444,6 +515,7 @@ def train_model(data_folder, model_folder, verbose):
     scaler = StandardScaler()
     Xs = scaler.fit_transform(imputer.fit_transform(X))
 
+    # PHASE 6: Train all candidate models
     if verbose:
         print('Training candidate models...')
 
@@ -487,6 +559,7 @@ def train_model(data_folder, model_folder, verbose):
     )
     candidates['mega'].fit(Xs, y)
 
+    # PHASE 7: Model selection via site-aware LOSO CV
     if FINAL_MODEL == "auto":
         if verbose:
             print('Running site-aware LOSO CV for model selection...')
@@ -532,6 +605,7 @@ def train_model(data_folder, model_folder, verbose):
         if verbose:
             print(f"Forced model: {selected_name}")
 
+    # PHASE 8: Save artifact
     os.makedirs(model_folder, exist_ok=True)
 
     artifact = {
@@ -555,10 +629,15 @@ def train_model(data_folder, model_folder, verbose):
 
 
 def load_model(model_folder, verbose):
+    """Load trained model artifact."""
     return joblib.load(os.path.join(model_folder, 'model.sav'))
 
 
 def run_model(model_artifact, record, data_folder, verbose):
+    """
+    Run trained model on a single record.
+    Returns: (binary_prediction, probability)
+    """
     patient_id = record[HEADERS['bids_folder']]
     site_id = record[HEADERS['site_id']]
     session_id = record[HEADERS['session_id']]
@@ -570,6 +649,7 @@ def run_model(model_artifact, record, data_folder, verbose):
     if feats is None:
         return float('nan'), float('nan')
 
+    # Extract SleepFM features if model was trained with them
     if model_artifact.get('use_sleepfm', False):
         sleepfm_extractor = SleepFMFeatureExtractor(verbose=False)
         if sleepfm_extractor.model is not None:
@@ -583,10 +663,12 @@ def run_model(model_artifact, record, data_folder, verbose):
     df = pd.DataFrame([feats])
     age = load_age(patient_data)
 
+    # Build interaction features
     for f1, f2, name in model_artifact.get('interactions', []):
         if f1 in df.columns and f2 in df.columns:
             df[name] = df[f1] * df[f2]
 
+    # Age residualization
     for col, lr in model_artifact.get('age_resid_models', {}).items():
         if col in df.columns:
             df[f"{col}_resid"] = df[col].values - lr.predict(np.array([[age]]))[0]
@@ -606,9 +688,18 @@ def run_model(model_artifact, record, data_folder, verbose):
     return binary, prob
 
 
+# =============================================================================
+# FEATURE EXTRACTION
+# =============================================================================
+
 def extract_all_features(data_folder, patient_id, site_id, session_id, patient_data):
+    """
+    Extract all features for a single patient record.
+    NOTE: Human annotations are NOT used - they are unavailable in validation/test.
+    """
     features = {}
 
+    # 1. Demographic features
     features['age'] = load_age(patient_data)
     sex = load_sex(patient_data, standardize=True)
     features['sex_male'] = 1 if sex == 'Male' else 0
@@ -619,10 +710,12 @@ def extract_all_features(data_folder, patient_id, site_id, session_id, patient_d
     features['race_other'] = 1 if race == 'Others' else 0
     features['bmi'] = load_bmi(patient_data)
 
+    # 2. CAISR algorithmic annotations (available in all sets)
     caisr_path = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER,
                               site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
     features.update(_extract_caisr(caisr_path))
 
+    # 3. Physiological signals
     physio_path = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
                                site_id, f"{patient_id}_ses-{session_id}.edf")
     features.update(_extract_physio(physio_path))
@@ -631,6 +724,7 @@ def extract_all_features(data_folder, patient_id, site_id, session_id, patient_d
 
 
 def _extract_caisr(edf_path):
+    """Extract features from CAISR algorithmic annotations EDF."""
     out = {
         'stage_caisr_tst': np.nan, 'stage_caisr_se': np.nan,
         'arousal_caisr_rate': np.nan, 'resp_caisr_ahi': np.nan,
@@ -674,6 +768,7 @@ def _extract_caisr(edf_path):
         if pa is None:
             pa = _sanitize(get(['prob', 'ar']))
 
+        # Sleep architecture
         if stages is not None and len(stages) > 0:
             tst = (len(stages) * 30) / 3600
             out['stage_caisr_tst'] = tst
@@ -682,6 +777,7 @@ def _extract_caisr(edf_path):
 
         dh = max(out['stage_caisr_tst'], 0.5)
 
+        # Event rates (per hr)
         if arousal is not None:
             out['arousal_caisr_rate'] = float(_count_events(arousal, [1]) / dh)
         if resp is not None:
@@ -693,11 +789,13 @@ def _extract_caisr(edf_path):
             out['limb_isolated_rate'] = float(_count_events(limbs, [1]) / dh)
             out['limb_periodic_rate'] = float(_count_events(limbs, [2]) / dh)
 
+        # Mean probabilities
         if pn3 is not None: out['caisr_prob_n3_mean'] = float(np.mean(pn3))
         if pn2 is not None: out['caisr_prob_n2_mean'] = float(np.mean(pn2))
         if pw  is not None: out['caisr_prob_w_mean']  = float(np.mean(pw))
         if pr  is not None: out['caisr_prob_r_mean']  = float(np.mean(pr))
 
+        # Softmax entropy across sleep stages
         plist = [pn3, pn2, pn1, pr, pw]
         if all(p is not None for p in plist):
             stacked = np.stack(plist, axis=0)
@@ -718,6 +816,7 @@ def _extract_caisr(edf_path):
 
 
 def _extract_physio(edf_path):
+    """Extract features from physiological signals with early/mid/late windowing."""
     out = {}
     for w in WINDOWS:
         for m in EEG_METRICS:
@@ -744,6 +843,7 @@ def _extract_physio(edf_path):
         eff, eff_fs = _find_sig(labels, data_dict, fs_dict, 'resp_effort')
         sp2, sp2_fs = _find_sig(labels, data_dict, fs_dict, 'spo2')
 
+        # Estimate recording duration
         dur = 0
         for s, f in [(eeg, eeg_fs), (emg, emg_fs), (ecg, ecg_fs),
                      (rsp, rsp_fs), (eff, eff_fs), (sp2, sp2_fs)]:
@@ -756,6 +856,7 @@ def _extract_physio(edf_path):
         bounds = {'early': (0, t3), 'mid': (t3, 2*t3), 'late': (2*t3, dur)}
 
         for stage, (st, en) in bounds.items():
+            # EEG spectral features
             if eeg is not None and eeg_fs > 0:
                 sl = eeg[int(st*eeg_fs):int(en*eeg_fs)]
                 if len(sl) > eeg_fs * 10:
@@ -764,27 +865,32 @@ def _extract_physio(edf_path):
                     for idx, m in enumerate(EEG_METRICS):
                         out[f'physio_{stage}_eeg_{m}'] = ef[idx]
 
+            # EMG RMS
             if emg is not None and emg_fs > 0:
                 sl = emg[int(st*emg_fs):int(en*emg_fs)]
                 if len(sl) > emg_fs * 10:
                     out[f'physio_{stage}_emg_rms'] = float(
                         np.sqrt(np.mean(np.square(sl - np.mean(sl)))))
 
+            # ECG HRV proxy
             if ecg is not None and ecg_fs > 0:
                 sl = ecg[int(st*ecg_fs):int(en*ecg_fs)]
                 if len(sl) > ecg_fs * 10:
                     out[f'physio_{stage}_ecg_hrv'] = float(np.var(np.diff(sl)))
 
+            # Respiratory frequency
             if rsp is not None and rsp_fs > 0:
                 sl = rsp[int(st*rsp_fs):int(en*rsp_fs)]
                 if len(sl) > rsp_fs * 10:
                     out[f'physio_{stage}_resp_freq'] = _resp_spectrum(sl, rsp_fs)[0]
 
+            # Respiratory effort variance
             if eff is not None and eff_fs > 0:
                 sl = eff[int(st*eff_fs):int(en*eff_fs)]
                 if len(sl) > eff_fs * 10:
                     out[f'physio_{stage}_resp_effort'] = float(np.var(sl))
 
+            # SpO2 drop (95th - 5th percentile)
             if sp2 is not None and sp2_fs > 0:
                 sl = sp2[int(st*sp2_fs):int(en*sp2_fs)]
                 if len(sl) > sp2_fs * 10:
@@ -796,7 +902,12 @@ def _extract_physio(edf_path):
     return out
 
 
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
 def _find_sig(labels, data_dict, fs_dict, target):
+    """Find signal by type using ordered manifest matching."""
     manifest = {
         'eeg': ['c3-m2','c4-m1','c3','c4','f3-m2','f4-m1','f3','f4',
                 'o1-m2','o2-m1','eeg'],
@@ -814,6 +925,7 @@ def _find_sig(labels, data_dict, fs_dict, target):
 
 
 def _sanitize(sig):
+    """Sanitize probability signal to [0, 1] range."""
     if sig is None or len(sig) == 0:
         return sig
     mn, mx = np.min(sig), np.max(sig)
@@ -825,6 +937,7 @@ def _sanitize(sig):
 
 
 def _count_events(arr, codes):
+    """Count contiguous events in a discrete signal."""
     if arr is None or len(arr) == 0:
         return 0
     b = np.isin(arr, codes).astype(int)
@@ -833,6 +946,7 @@ def _count_events(arr, codes):
 
 
 def _eeg_spectrum(signal, fs):
+    """Extract 12 EEG spectral features."""
     if signal is None or len(signal) == 0:
         return [np.nan] * 12
     try:
@@ -867,6 +981,7 @@ def _eeg_spectrum(signal, fs):
 
 
 def _resp_spectrum(signal, fs):
+    """Extract respiratory peak frequency and effort variance."""
     if signal is None or len(signal) == 0:
         return [np.nan, np.nan]
     try:
@@ -884,6 +999,10 @@ def _resp_spectrum(signal, fs):
 
 
 def _age_auroc(y_true, y_prob, ages, delta=2.0):
+    """
+    Compute age-conditioned AUROC (official challenge metric).
+    Only compares positive/negative pairs within delta years.
+    """
     y_true, y_prob, ages = np.asarray(y_true), np.asarray(y_prob), np.asarray(ages)
     pos = np.where(y_true == 1)[0]
     neg = np.where(y_true == 0)[0]
@@ -899,6 +1018,7 @@ def _age_auroc(y_true, y_prob, ages, delta=2.0):
 
 
 def _make_fresh_model(name):
+    """Create a fresh unfitted model for CV evaluation."""
     if name == 'logistic':
         return LogisticRegression(C=0.5, penalty='l2', solver='liblinear',
                                    class_weight='balanced', max_iter=1000, random_state=42)
