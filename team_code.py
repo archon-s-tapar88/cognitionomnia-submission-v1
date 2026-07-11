@@ -305,7 +305,7 @@ def train_model(data_folder, model_folder, verbose):
 
     valid_mask = np.array(scores) > 0.50
     scores = np.array(scores)
-    scores[~valid_mask] = 0.0
+    scores[~valid_mask] = -1e9  # <-- not 0.0
 
     # Softmax weighting
     exp_scores = np.exp(scores - np.max(scores))
