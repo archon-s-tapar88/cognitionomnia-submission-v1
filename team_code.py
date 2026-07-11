@@ -301,10 +301,14 @@ def train_model(data_folder, model_folder, verbose):
     for name in names:
         valid = ~np.isnan(oof_probs[name])
         sc = _age_auroc(y[valid], oof_probs[name][valid], ages[valid], delta=2.0)
-        scores.append(max(sc, 0.5))  # floor at 0.5 to avoid zeros
+        scores.append(sc)
+
+    valid_mask = np.array(scores) > 0.50
+    scores = np.array(scores)
+    scores[~valid_mask] = 0.0
 
     # Softmax weighting
-    exp_scores = np.exp(np.array(scores) - np.max(scores))
+    exp_scores = np.exp(scores - np.max(scores))
     best_w = exp_scores / np.sum(exp_scores)
     ensemble_weights = dict(zip(names, best_w))
     
@@ -876,7 +880,7 @@ def _make_fresh_model(name):
     else:
         raise ValueError(f"Unknown model name: {name}")
     
-    
+
 # #!/usr/bin/env python
 # PhysioNet Challenge 2026 - Age-Conditioned AUROC Optimized v4
 # Wins by: age-residualized features + stage-conditional spectral + ensemble weight optimization
