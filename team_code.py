@@ -649,7 +649,7 @@ def _extract_physio(edf_path, stages=None):
             if ecg is not None and ecg_fs > 0:
                 sl = ecg[int(st*ecg_fs):int(en*ecg_fs)]
                 if len(sl) > ecg_fs * 10:
-                    out[f'physio_{stage}_ecg_hrv'] = float(np.var(np.diff(sl)))
+                    out[f'physio_{stage}_ecg_hrv'] = float(np.var(np.diff(sl))) * (ecg_fs ** 2)
                     # Simple mean HR estimate
                     peaks, _ = scipy.signal.find_peaks(sl, distance=int(0.5*ecg_fs),
                                                         prominence=np.std(sl)*0.3)
