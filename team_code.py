@@ -796,17 +796,55 @@ def _resp_spectrum(signal, fs):
         return [np.nan, np.nan]
 
 
+MANIFEST = {
+    'eeg': [
+        'c3-m2', 'c4-m1', 'f3-m2', 'f4-m1', 'o1-m2', 'o2-m1',
+        'c3-avg', 'c4-avg', 'f3-avg', 'f4-avg', 'o1-avg', 'o2-avg',
+        'e1-m2', 'e2-m1', 'e1-avg', 'e2-avg', 'e2-m2',
+        'c3-a2', 'c4-a1', 'c3:m2', 'c4:m1', 'f3:m2', 'f4:m1',
+        'o1-a2', 'o2-a1', 'o1:m2', 'o2:m1',
+        'loc-a2', 'roc-a1',
+        'c3', 'c4', 'f3', 'f4', 'o1', 'o2', 'e1', 'e2',
+        'loc', 'roc',
+        'eeg'
+    ],
+    'emg': [
+        'chin1-chin2', 'chin', 'emg.subm', 'emg', 'chin1', 'emg1', 'chin2', 'emg2',
+        'chin-a', 'chin-l', 'chin-r',
+        'china', 'chinl', 'chinr',
+        'chin emg',
+        'submental', 'submentalis', 'chin-emg'
+    ],
+    'ecg': [
+        'ecg', 'ekg', 'ecg-la', 'ecg-v1', 'ecg i', 'ecg ii',
+        'ecg1', 'ecg2',
+        'ekg-l', 'ekg-r',
+        'ecg iii', 'lead ii', 'lead iii', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6'
+    ],
+    'resp_airflow': [
+        'airflow', 'flow', 'thermal', 'thermistor', 'nasal_pressure',
+        'nasal', 'nasaloral', 'cannula', 'c-flow', 'c press', 'c-pres',
+        'npt', 'ptaf', 'cpap flow', 'flow_dr'
+    ],
+    'resp_effort': [
+        'abd', 'abdomen', 'chest', 'thorax', 'effort abd', 'effort tho',
+        'abdominal', 'thoracic', 'effort_abd', 'effort_tho',
+        'respitrace abdom', 'respitrace chest', 'thoracic'
+    ],
+    'spo2': [
+        'spo2', 'sao2', 'osat', 'o2sat', 'oximetry', 'pulse ox', 'pulse_ox'
+    ],
+    'eog': [
+        'e1-m2', 'e2-m1', 'e1', 'e2', 'eog', 'loc', 'roc', 'eog-l', 'eog-r',
+        'loc-a2', 'roc-a1', 'e1:m2', 'e2:m1'
+    ]
+}
+
+
 def _find_sig(labels, data_dict, fs_dict, target):
-    manifest = {
-        'eeg': ['c3-m2','c4-m1','c3','c4','f3-m2','f4-m1','f3','f4',
-                'o1-m2','o2-m1','eeg'],
-        'emg': ['chin1-chin2','chin','emg.subm','emg','chin1','emg1','chin2','emg2'],
-        'ecg': ['ecg','ekg','ecg-la','ecg-v1','ecg i','ecg ii','ecg1'],
-        'resp_airflow': ['airflow','flow','thermal','thermistor','nasal_pressure'],
-        'resp_effort': ['abd','abdomen','chest','thorax','effort abd','effort tho'],
-        'spo2': ['spo2','sao2','osat','o2sat']
-    }
-    for t in manifest.get(target, []):
+    """Find signal by type using ordered manifest matching."""
+    manifest = MANIFEST.get(target, [])
+    for t in manifest:
         for lbl in labels:
             if t in lbl:
                 return data_dict[lbl], fs_dict.get(lbl, 1.0)
