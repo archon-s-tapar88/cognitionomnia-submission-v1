@@ -180,9 +180,9 @@ class SleepFMFeatureExtractor:
                     matched_data = []
 
                     for ch_name in raw.ch_names:
-                        ch_lower = ch_name.lower().replace(' ', '_').replace('-', '_')
+                        ch_lower = ch_name.lower().replace(' ', '').replace('_', '').replace('-', '')
                         for target in channel_list:
-                            target_lower = target.lower().replace('-', '_')
+                            target_lower = target.lower().replace(' ', '').replace('_', '').replace('-', '')
                             if target_lower in ch_lower or ch_lower in target_lower:
                                 # Load only this ONE channel from disk
                                 data = raw.get_data(picks=ch_name)[0]
