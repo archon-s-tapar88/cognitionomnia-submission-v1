@@ -118,11 +118,7 @@ respect to the metric that actually decides rankings.
 """
 
 import os
-import sys
-import json
 import warnings
-import traceback
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -141,12 +137,6 @@ try:
     _HAVE_LGB = True
 except Exception:
     _HAVE_LGB = False
-
-try:
-    import pyedflib  # noqa: F401
-    _HAVE_PYEDFLIB = True
-except Exception:
-    _HAVE_PYEDFLIB = False
 
 from helper_code import *  # noqa: F401,F403  (official Challenge I/O: find_patients, load_demographics,
                             # load_diagnoses, load_age, load_sex, load_race, load_bmi, load_ethnicity,
@@ -244,13 +234,16 @@ def train_model(data_folder, model_folder, verbose):
     if verbose:
         print('Finding Challenge data...')
 
-    records = find_patients(data_folder)
+    # find_patients(patient_data_file) takes the demographics.csv PATH, not the data
+    # folder (confirmed against the real helper_code.py) - patient_data_file has to be
+    # built first.
+    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    records = find_patients(patient_data_file)
     if len(records) == 0:
         raise FileNotFoundError('No data were provided.')
     if verbose:
         print(f'Found {len(records)} patient/session records.')
 
-    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     demo_df = pd.read_csv(patient_data_file)  # loaded ONCE; official load_demographics()/
                                                # load_diagnoses() re-read this file from disk
                                                # on every single call, which is fine for one
@@ -625,13 +618,25 @@ def load_edf_to_nparrays_safe(path):
 
 def _standardize_channels_safe(raw_names, rename_rules):
     """Returns {standardized_name: raw_name} if the official standardizer is available
-    and works; otherwise returns {lowercased_raw_name: raw_name} unchanged."""
+    and works; otherwise returns {lowercased_raw_name: raw_name} unchanged.
+
+    NOTE: the real helper_code.py's standardize_channel_names_rename_only returns a
+    TUPLE (rename_map, cols_to_drop), where rename_map is {Original Raw Name: New
+    Standard Name} - the opposite direction from what this function needs to hand
+    back to _get_channel (which wants {standard_name: raw_name} so it can look a
+    candidate name up directly). This inverts it accordingly. cols_to_drop
+    (duplicate-alias columns the official function flags) is intentionally unused
+    here - this file never mutates or drops raw channels, it only ever *reads* from
+    sig_dict by name, so a channel being on that list has no effect on correctness,
+    just a minor missed tidiness optimization."""
     fn = globals().get('standardize_channel_names_rename_only', None)
     if fn is not None and rename_rules is not None:
         try:
-            mapping = fn(raw_names, rename_rules)
-            if isinstance(mapping, dict) and len(mapping) > 0:
-                return mapping
+            result = fn(list(raw_names), rename_rules)
+            rename_map = result[0] if isinstance(result, tuple) else result
+            if isinstance(rename_map, dict) and len(rename_map) > 0:
+                inverted = {std_name: raw_name for raw_name, std_name in rename_map.items()}
+                return inverted
         except Exception:
             pass
     return {str(n).strip().lower(): n for n in raw_names}
@@ -666,46 +671,64 @@ def _derive_bipolar_safe(sig_dict, fields_dict, pos_key, neg_keys):
 def _get_channel(sig_dict, fields_dict, candidates, rename_rules=None):
     """
     Finds a channel matching a priority list of candidate names/substrings. Tries, in
-    order: (1) an exact standardized-name match if the candidate itself looks like a
-    bipolar pair (e.g. 'c4-m1') and both electrodes exist unipolarly, using official
-    bipolar derivation; (2) a direct substring match against available channel names
-    (handles EDFs that already ship a combined/bipolar channel under one label).
+    order, for each candidate: (1) a direct hit through the official channel-alias map
+    (handles a channel that's already combined/bipolar but filed under a non-standard
+    name, e.g. raw 'C4-A1' aliased to standard 'c4-m1' in channel_table.csv); (2) a
+    direct substring match against raw channel names (handles EDFs that already ship a
+    combined/bipolar channel under a name that happens to match); (3) only if the
+    candidate itself looks like a bipolar pair (e.g. 'c4-m1') and neither of the above
+    fired, deriving it from separate positive/negative electrodes via official bipolar
+    derivation. This order matters: trying (3) before (1)/(2) can miss a channel that's
+    only reachable through the alias map, since a candidate like 'c4-m1' splitting into
+    pos='c4'/neg='m1' has no reason to find raw electrodes named something else
+    entirely - the alias map has to be checked as a whole-candidate lookup first.
     Returns (signal_array, sampling_rate) or (None, None).
     """
     if sig_dict is None or len(sig_dict) == 0:
         return None, None
     raw_names = list(sig_dict.keys())
-    std_map = _standardize_channels_safe(raw_names, rename_rules)  # {std_or_lower_name: raw_name}
+    std_map = _standardize_channels_safe(raw_names, rename_rules)  # {standard_name: raw_name}
     lower_sig = {str(k).strip().lower(): v for k, v in sig_dict.items()}
     lower_fields = {str(k).strip().lower(): v for k, v in fields_dict.items()} if fields_dict else {}
 
     for cand in candidates:
         cand_l = cand.lower()
-        # (1) bipolar derivation, e.g. 'c4-m1' -> pos='c4', neg=['m1']
-        if '-' in cand_l:
-            pos, neg = cand_l.split('-', 1)
-            neg_list = [n.strip() for n in neg.split('+')]
-            pool = {**lower_sig}
-            for std_name, raw_name in std_map.items():
-                if raw_name in sig_dict and std_name not in pool:
-                    pool[std_name] = sig_dict[raw_name]
-            pos_key = pos if pos in pool else None
-            negs_present = [n for n in neg_list if n in pool]
-            if pos_key and negs_present:
-                fields_pool = {**lower_fields}
-                for std_name, raw_name in std_map.items():
-                    if raw_name in fields_dict and std_name not in fields_pool:
-                        fields_pool[std_name] = fields_dict[raw_name]
-                derived, fs = _derive_bipolar_safe(pool, fields_pool, pos_key, negs_present)
-                if derived is not None and len(derived) > 0:
-                    return np.asarray(derived, dtype=float), fs
-        # (2) direct substring match (handles pre-combined channels)
+
+        # (1) direct hit via the official alias map, keyed on the WHOLE candidate.
+        if cand_l in std_map and std_map[cand_l] in sig_dict:
+            raw_name = std_map[cand_l]
+            sig = sig_dict[raw_name]
+            fs = fields_dict.get(raw_name, None) if fields_dict else None
+            if sig is not None and len(sig) > 0:
+                return np.asarray(sig, dtype=float), fs
+
+        # (2) direct substring match against raw channel names.
         for name_l in lower_sig.keys():
             if cand_l == name_l or cand_l in name_l:
                 sig = lower_sig[name_l]
                 fs = lower_fields.get(name_l, None)
                 if sig is not None and len(sig) > 0:
                     return np.asarray(sig, dtype=float), fs
+
+        # (3) bipolar derivation from separate electrodes, e.g. 'c4-m1' -> pos='c4', neg=['m1'].
+        # Electrode components are looked up through BOTH the alias map and raw lowercased
+        # names, since a single electrode (e.g. bare 'm1') could be aliased too.
+        if '-' in cand_l:
+            pos, neg = cand_l.split('-', 1)
+            neg_list = [n.strip() for n in neg.split('+')]
+            pool = {**lower_sig}
+            pool_fields = {**lower_fields}
+            for std_name, raw_name in std_map.items():
+                if raw_name in sig_dict and std_name not in pool:
+                    pool[std_name] = sig_dict[raw_name]
+                    if fields_dict and raw_name in fields_dict:
+                        pool_fields[std_name] = fields_dict[raw_name]
+            pos_key = pos if pos in pool else None
+            negs_present = [n for n in neg_list if n in pool]
+            if pos_key and negs_present:
+                derived, fs = _derive_bipolar_safe(pool, pool_fields, pos_key, negs_present)
+                if derived is not None and len(derived) > 0:
+                    return np.asarray(derived, dtype=float), fs
     return None, None
 
 
