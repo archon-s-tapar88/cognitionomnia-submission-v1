@@ -244,7 +244,7 @@ def train_model(data_folder, model_folder, verbose):
 
     # 2. Soft-voting ensemble: logistic + slightly different logistic
     candidates['ensemble'] = VotingClassifier(
-        estimimators=[
+        estimators=[
             ('lr1', LogisticRegression(C=0.1, penalty='l2', solver='liblinear',
                                        class_weight='balanced', max_iter=1000, random_state=42)),
             ('lr2', LogisticRegression(C=0.05, penalty='l2', solver='liblinear',
